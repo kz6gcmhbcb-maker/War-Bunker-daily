@@ -10,9 +10,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+# The leaderboard endpoint is paginated/limited. 1000 is intentionally used so
+# the daily roster can include faction members outside the first 25 entries.
 API_URL = os.getenv(
     "API_URL",
-    "https://chronicles.wfitapp.xyz/api/raid/leaderboard?limit=25",
+    "https://chronicles.wfitapp.xyz/api/raid/leaderboard?limit=1000",
 )
 TOKEN = os.getenv("DISCORD_TOKEN")
 POLL_SECONDS = max(20, int(os.getenv("POLL_SECONDS", "60")))
@@ -21,7 +23,6 @@ DB_FILE = Path(os.getenv("DB_FILE", "war_bunker.sqlite3"))
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.messages = True
 
 client = commands.Bot(command_prefix="!", intents=intents)
 tree = client.tree
@@ -37,6 +38,7 @@ def day_key():
 
 
 def get_db():
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     conn.execute(
@@ -59,6 +61,19 @@ def get_db():
         CREATE TABLE IF NOT EXISTS daily_meta (
             day TEXT PRIMARY KEY,
             started_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attack_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,
+            uid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            faction TEXT NOT NULL,
+            delta INTEGER NOT NULL,
+            detected_at TEXT NOT NULL
         )
         """
     )
@@ -203,10 +218,7 @@ def players(data, faction=None):
 
     if faction:
         q = faction.strip().lower()
-        rows = [
-            p for p in rows
-            if pfaction(p).strip().lower() == q
-        ]
+        rows = [p for p in rows if pfaction(p).strip().lower() == q]
 
     return sorted(
         rows,
@@ -236,8 +248,11 @@ def record_daily(data):
     """
     Track the delta of the cumulative player `attacks` counter.
 
-    Returns attack events observed during this poll:
-    [(uid, name, faction, delta), ...]
+    Attack timestamps are detection timestamps: the moment the bot's poll
+    notices that the cumulative counter increased. The leaderboard does not
+    expose an official per-attack timestamp/history.
+
+    Returns attack events observed during this poll.
     """
     today = day_key()
     timestamp = now().isoformat(timespec="seconds")
@@ -285,13 +300,29 @@ def record_daily(data):
             delta = max(0, current - previous)
 
             if delta:
-                events.append(
-                    {
-                        "uid": player_uid,
-                        "name": name,
-                        "faction": faction,
-                        "delta": delta,
-                    }
+                event = {
+                    "uid": player_uid,
+                    "name": name,
+                    "faction": faction,
+                    "delta": delta,
+                    "detected_at": timestamp,
+                }
+                events.append(event)
+
+                conn.execute(
+                    """
+                    INSERT INTO attack_events
+                    (day, uid, name, faction, delta, detected_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        today,
+                        player_uid,
+                        name,
+                        faction,
+                        delta,
+                        timestamp,
+                    ),
                 )
 
             conn.execute(
@@ -320,40 +351,66 @@ def record_daily(data):
     return events
 
 
-def daily_info(faction):
-    today = day_key()
+def parse_target_day(value: Optional[str]):
+    if not value:
+        return day_key()
+    try:
+        parsed = datetime.strptime(value.strip(), "%Y-%m-%d")
+        return parsed.date().isoformat()
+    except ValueError as exc:
+        raise ValueError("Date must be in YYYY-MM-DD format.") from exc
+
+
+def daily_info(faction, target_day=None):
+    target_day = target_day or day_key()
 
     with get_db() as conn:
         meta = conn.execute(
             "SELECT started_at FROM daily_meta WHERE day=?",
-            (today,),
+            (target_day,),
         ).fetchone()
 
         rows = conn.execute(
             """
-            SELECT *
-            FROM players_daily
-            WHERE day=? AND lower(faction)=lower(?)
+            SELECT p.*,
+                   (
+                       SELECT MAX(e.detected_at)
+                       FROM attack_events e
+                       WHERE e.day=p.day AND e.uid=p.uid
+                   ) AS last_attack_at
+            FROM players_daily p
+            WHERE p.day=? AND lower(p.faction)=lower(?)
             ORDER BY attacks_today DESC, name COLLATE NOCASE
             """,
-            (today, faction),
+            (target_day, faction),
         ).fetchall()
 
     return (meta["started_at"] if meta else None), rows
 
 
-def build_daily_embed(faction, view="all"):
-    started_at, rows = daily_info(faction)
+def format_time(iso_value):
+    if not iso_value:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_value)
+        return dt.strftime("%H:%M:%S")
+    except ValueError:
+        return iso_value
+
+
+def build_daily_embed(faction, view="all", target_day=None):
+    target_day = target_day or day_key()
+    started_at, rows = daily_info(faction, target_day)
 
     attacked = [r for r in rows if iv(r["attacks_today"]) > 0]
     missing = [r for r in rows if iv(r["attacks_today"]) == 0]
 
     if view == "attacked":
         shown = attacked
-        title = f"⚡ {faction.upper()} — ATTACKED TODAY"
+        title = f"⚡ {faction.upper()} — ATTACKED"
     elif view == "missing":
         shown = missing
-        title = f"⚡ {faction.upper()} — NOT ATTACKED TODAY"
+        title = f"⚡ {faction.upper()} — NOT ATTACKED"
     else:
         shown = rows
         title = f"⚡ {faction.upper()} — DAILY ATTACK CHECK"
@@ -362,37 +419,31 @@ def build_daily_embed(faction, view="all"):
 
     if not rows:
         embed.description = (
-            "No players have been captured by the daily tracker yet."
+            f"No players were captured by the daily tracker for **{target_day}**."
         )
-        embed.set_footer(
-            text="WAR BUNKER • DAILY TRACKER"
-        )
+        embed.set_footer(text="WAR BUNKER • DAILY HISTORY")
         return embed
 
-    if view == "all":
-        embed.description = (
-            f"**{len(attacked)}** attacked • "
-            f"**{len(missing)}** not attacked\n"
-            f"Day: **{day_key()}** • Timezone: **{TIMEZONE}**"
-        )
-    elif view == "attacked":
-        embed.description = (
-            f"**{len(attacked)}** player(s) with an observed attack today."
-        )
-    else:
-        embed.description = (
-            f"**{len(missing)}** player(s) with no observed attack today."
-        )
+    embed.description = (
+        f"Day: **{target_day}** • Timezone: **{TIMEZONE}**\n"
+        f"Roster captured: **{len(rows)}** • "
+        f"Attacked: **{len(attacked)}** • "
+        f"Not attacked: **{len(missing)}**"
+    )
 
     lines = []
     for index, row in enumerate(shown, 1):
         count = iv(row["attacks_today"])
+        last_attack = format_time(row["last_attack_at"])
+
         if view == "missing":
-            lines.append(f"{index}. **{row['name']}**")
-        else:
+            lines.append(f"{index}. **{row['name']}** — 0 attacks")
+        elif last_attack:
             lines.append(
-                f"{index}. **{row['name']}** — **{count}** attack(s)"
+                f"{index}. **{row['name']}** — **{count}** attack(s) • 🕒 **{last_attack}**"
             )
+        else:
+            lines.append(f"{index}. **{row['name']}** — **{count}** attack(s)")
 
     chunks = []
     current = ""
@@ -413,29 +464,33 @@ def build_daily_embed(faction, view="all"):
             inline=False,
         )
 
-    coverage = (
-        "Tracker started today at "
-        f"{started_at.split('T')[1] if started_at and 'T' in started_at else started_at}."
-        if started_at
-        else "Tracker start time unavailable."
-    )
+    if started_at:
+        started_time = format_time(started_at)
+        coverage = f"Tracker started {target_day} at {started_time}."
+    else:
+        coverage = "Tracker start time unavailable."
 
     embed.set_footer(
         text=(
             f"WAR BUNKER • {coverage} "
-            "Earlier attacks cannot be reconstructed from leaderboard data."
+            "Attack times are bot detection timestamps."
         )
     )
     return embed
 
 
 def activity_embed(faction, events):
+    lines = []
+    for event in events:
+        stamp = format_time(event.get("detected_at")) or "unknown"
+        lines.append(
+            f"• **{event['name']}** made **{event['delta']}** new attack(s) "
+            f"• 🕒 **{stamp}**"
+        )
+
     embed = discord.Embed(
         title="⚡ RAID ACTIVITY",
-        description="\n".join(
-            f"• **{event['name']}** made **{event['delta']}** new attack(s)"
-            for event in events
-        ),
+        description="\n".join(lines),
         color=0x42F5C5,
     )
 
@@ -444,7 +499,9 @@ def activity_embed(faction, events):
         value=f"**{faction}**",
         inline=False,
     )
-    embed.set_footer(text="THE CURRENT FINDS ITS OWN. • EVENT-DRIVEN")
+    embed.set_footer(
+        text=f"THE CURRENT FINDS ITS OWN. • {TIMEZONE} • DETECTION TIME"
+    )
     return embed
 
 
@@ -468,10 +525,7 @@ async def faction_autocomplete(interaction, current):
 
 
 def configured_faction(guild_id, faction=None):
-    return (
-        faction
-        or configs.get(str(guild_id), {}).get("faction")
-    )
+    return faction or configs.get(str(guild_id), {}).get("faction")
 
 
 @tree.command(
@@ -519,26 +573,26 @@ async def status(interaction):
         )
         return
 
-    channel = interaction.guild.get_channel(
-        iv(config["channel_id"])
-    )
+    channel = interaction.guild.get_channel(iv(config["channel_id"]))
 
     await interaction.response.send_message(
         f"Channel: {channel.mention if channel else 'not found'}\n"
         f"Faction: **{config['faction']}**\n"
         f"Attack alerts: **{'ON' if config['alerts'] else 'OFF'}**\n"
-        f"Daily timezone: **{TIMEZONE}**",
+        f"Daily timezone: **{TIMEZONE}**\n"
+        f"API roster limit: **1000**",
         ephemeral=True,
     )
 
 
 @tree.command(
     name="daily",
-    description="Show who attacked and who did not attack today.",
+    description="Show a faction's daily attack history.",
 )
 @app_commands.describe(
     faction="Optional; defaults to server faction.",
     view="all, attacked, or missing.",
+    date="Optional date in YYYY-MM-DD. Leave empty for today.",
 )
 @app_commands.autocomplete(faction=faction_autocomplete)
 @app_commands.choices(
@@ -552,6 +606,7 @@ async def daily(
     interaction,
     faction: Optional[str] = None,
     view: str = "all",
+    date: Optional[str] = None,
 ):
     faction = configured_faction(interaction.guild_id, faction)
 
@@ -562,17 +617,73 @@ async def daily(
         )
         return
 
+    try:
+        target_day = parse_target_day(date)
+    except ValueError as ex:
+        await interaction.response.send_message(str(ex), ephemeral=True)
+        return
+
     await interaction.response.defer()
 
     try:
-        data = await fetch()
-        record_daily(data)
-        embed = build_daily_embed(faction, view)
+        # Only today's live poll changes the database. Older dates are read-only.
+        if target_day == day_key():
+            data = await fetch()
+            record_daily(data)
+
+        embed = build_daily_embed(faction, view, target_day)
         await interaction.followup.send(embed=embed)
     except Exception as ex:
         await interaction.followup.send(
             f"⚠️ Daily tracker error: `{type(ex).__name__}`"
         )
+
+
+@tree.command(
+    name="dailyhistory",
+    description="List recent days recorded by the daily tracker.",
+)
+@app_commands.describe(days="Number of recent days to list (1-14).")
+async def dailyhistory(interaction, days: Optional[int] = 7):
+    days = max(1, min(days or 7, 14))
+
+    await interaction.response.defer()
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT d.day,
+                   d.started_at,
+                   COUNT(p.uid) AS roster,
+                   SUM(CASE WHEN p.attacks_today > 0 THEN 1 ELSE 0 END) AS attacked
+            FROM daily_meta d
+            LEFT JOIN players_daily p ON p.day=d.day
+            GROUP BY d.day, d.started_at
+            ORDER BY d.day DESC
+            LIMIT ?
+            """,
+            (days,),
+        ).fetchall()
+
+    embed = discord.Embed(
+        title="⚡ DAILY HISTORY",
+        color=0x42F5C5,
+    )
+
+    if not rows:
+        embed.description = "No daily history has been recorded yet."
+    else:
+        lines = []
+        for row in rows:
+            started = format_time(row["started_at"]) or "?"
+            lines.append(
+                f"**{row['day']}** — {iv(row['attacked'])}/{iv(row['roster'])} "
+                f"attacked • tracker {started}"
+            )
+        embed.description = "\n".join(lines)
+
+    embed.set_footer(text="Use `/daily date:YYYY-MM-DD` to open a saved day.")
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(
@@ -590,9 +701,7 @@ async def update_cmd(interaction):
         )
         return
 
-    channel = interaction.guild.get_channel(
-        iv(config["channel_id"])
-    )
+    channel = interaction.guild.get_channel(iv(config["channel_id"]))
 
     if not channel:
         await interaction.response.send_message(
@@ -611,10 +720,7 @@ async def update_cmd(interaction):
 
     for faction in factions(data):
         embed.add_field(
-            name=(
-                f"#{iv(faction.get('rank'))} "
-                f"{faction.get('factionName')}"
-            ),
+            name=f"#{iv(faction.get('rank'))} {faction.get('factionName')}",
             value=(
                 f"Points: **{fmt(faction.get('points'))}** • "
                 f"Damage: **{fmt(faction.get('damage'))}**\n"
@@ -632,10 +738,7 @@ async def update_cmd(interaction):
     )
 
 
-@tree.command(
-    name="top5",
-    description="Show top 5 players.",
-)
+@tree.command(name="top5", description="Show top 5 players.")
 @app_commands.describe(faction="Optional faction filter.")
 @app_commands.autocomplete(faction=faction_autocomplete)
 async def top5(interaction, faction: Optional[str] = None):
@@ -643,10 +746,7 @@ async def top5(interaction, faction: Optional[str] = None):
     data = await fetch()
     rows = players(data, faction)[:5]
 
-    embed = discord.Embed(
-        title="⚡ TOP 5 PLAYERS",
-        color=0x42F5C5,
-    )
+    embed = discord.Embed(title="⚡ TOP 5 PLAYERS", color=0x42F5C5)
 
     for index, player in enumerate(rows, 1):
         embed.add_field(
@@ -665,25 +765,16 @@ async def top5(interaction, faction: Optional[str] = None):
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(
-    name="topfactions",
-    description="Show all factions ranked.",
-)
+@tree.command(name="topfactions", description="Show all factions ranked.")
 async def topfactions(interaction):
     await interaction.response.defer()
     data = await fetch()
 
-    embed = discord.Embed(
-        title="⚡ FACTION LEADERBOARD",
-        color=0x42F5C5,
-    )
+    embed = discord.Embed(title="⚡ FACTION LEADERBOARD", color=0x42F5C5)
 
     for faction in factions(data):
         embed.add_field(
-            name=(
-                f"#{iv(faction.get('rank'))} "
-                f"{faction.get('factionName')}"
-            ),
+            name=f"#{iv(faction.get('rank'))} {faction.get('factionName')}",
             value=(
                 f"Points: **{fmt(faction.get('points'))}** • "
                 f"Damage: **{fmt(faction.get('damage'))}** • "
@@ -695,10 +786,7 @@ async def topfactions(interaction):
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(
-    name="stats",
-    description="Show stats for a faction.",
-)
+@tree.command(name="stats", description="Show stats for a faction.")
 @app_commands.describe(faction="Faction to inspect.")
 @app_commands.autocomplete(faction=faction_autocomplete)
 async def stats(interaction, faction: str):
@@ -722,19 +810,12 @@ async def stats(interaction, faction: str):
             ("WALKERS", "players"),
             ("WINS", "wins"),
         ]:
-            embed.add_field(
-                name=label,
-                value=fmt(item.get(key)),
-                inline=True,
-            )
+            embed.add_field(name=label, value=fmt(item.get(key)), inline=True)
 
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(
-    name="disable",
-    description="Disable automatic attack alerts.",
-)
+@tree.command(name="disable", description="Disable automatic attack alerts.")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def disable(interaction):
     set_alerts(interaction.guild_id, False)
@@ -744,10 +825,7 @@ async def disable(interaction):
     )
 
 
-@tree.command(
-    name="enable",
-    description="Enable automatic attack alerts.",
-)
+@tree.command(name="enable", description="Enable automatic attack alerts.")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def enable(interaction):
     set_alerts(interaction.guild_id, True)
@@ -784,33 +862,19 @@ async def monitor():
             if not guild:
                 continue
 
-            channel = guild.get_channel(
-                iv(config["channel_id"])
-            )
+            channel = guild.get_channel(iv(config["channel_id"]))
             if not channel:
                 continue
 
             try:
                 await channel.send(
-                    embed=activity_embed(
-                        config["faction"],
-                        relevant,
-                    )
+                    embed=activity_embed(config["faction"], relevant)
                 )
             except Exception as ex:
-                print(
-                    "Activity post error:",
-                    guild_id,
-                    type(ex).__name__,
-                    ex,
-                )
+                print("Activity post error:", guild_id, type(ex).__name__, ex)
 
     except Exception as ex:
-        print(
-            "Monitor error:",
-            type(ex).__name__,
-            ex,
-        )
+        print("Monitor error:", type(ex).__name__, ex)
 
 
 @monitor.before_loop
@@ -819,49 +883,28 @@ async def before_monitor():
 
 
 async def sync_commands():
-    """
-    Guild-only sync. Clear the old guild command cache first,
-    then sync the current definitions. Finally remove old global
-    commands left by previous versions.
-    """
     for guild in client.guilds:
         try:
             tree.clear_commands(guild=guild)
             tree.copy_global_to(guild=guild)
             synced = await tree.sync(guild=guild)
-            print(
-                f"Guild sync: {guild.name} -> "
-                f"{len(synced)} commands"
-            )
+            print(f"Guild sync: {guild.name} -> {len(synced)} commands")
         except Exception as ex:
-            print(
-                "Guild sync error:",
-                guild.id,
-                type(ex).__name__,
-                ex,
-            )
+            print("Guild sync error:", guild.id, type(ex).__name__, ex)
 
     try:
         tree.clear_commands(guild=None)
         await tree.sync()
         print("Legacy global commands cleared.")
     except Exception as ex:
-        print(
-            "Global cleanup error:",
-            type(ex).__name__,
-            ex,
-        )
+        print("Global cleanup error:", type(ex).__name__, ex)
 
 
 @client.event
 async def on_ready():
     load_configs()
 
-    print(
-        f"Logged in as {client.user}. "
-        f"Servers: {len(client.guilds)}"
-    )
-
+    print(f"Logged in as {client.user}. Servers: {len(client.guilds)}")
     await sync_commands()
 
     if not monitor.is_running():
