@@ -1,752 +1,480 @@
-
 import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import tasks
 
-VERSION = "1.5.0"
 BOT_NAME = "WChronicles RaidOps"
-API_URL = os.getenv(
-    "API_URL",
-    "https://chronicles.wfitapp.xyz/api/raid/leaderboard?limit=60",
-)
-TOKEN = os.getenv("DISCORD_TOKEN")
-POLL_SECONDS = max(20, int(os.getenv("POLL_SECONDS", "60")))
-TIMEZONE = "UTC"
+API_URL = os.getenv("API_URL", "https://chronicles.wfitapp.xyz/api/raid/leaderboard?limit=60")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+TIMEZONE = os.getenv("DAILY_TIMEZONE", "UTC")
 DB_FILE = Path(os.getenv("DB_FILE", "/data/war_bunker.sqlite3"))
 
+try:
+    LOCAL_TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    LOCAL_TZ = timezone.utc
+    TIMEZONE = "UTC"
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is not set")
+
 intents = discord.Intents.default()
-intents.guilds = True
-client = commands.Bot(command_prefix="!", intents=intents)
-tree = client.tree
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+monitor_started = False
 configs = {}
 
-
-def now():
-    return datetime.now(timezone.utc)
-
-
-def iso_now():
-    return now().isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def day_key():
-    return now().date().isoformat()
+# One Discord server can have up to six independent faction trackers.
+MAX_TRACKERS_PER_GUILD = 6
 
 
 def db():
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS players_daily (
-            day TEXT NOT NULL,
-            uid TEXT NOT NULL,
-            name TEXT NOT NULL,
-            faction TEXT NOT NULL,
-            start_attacks INTEGER NOT NULL DEFAULT 0,
-            last_attacks INTEGER NOT NULL DEFAULT 0,
-            attacks_today INTEGER NOT NULL DEFAULT 0,
-            last_seen TEXT NOT NULL,
-            PRIMARY KEY(day, uid)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_meta (
-            day TEXT PRIMARY KEY,
-            started_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS attack_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day TEXT NOT NULL,
-            uid TEXT NOT NULL,
-            name TEXT NOT NULL,
-            faction TEXT NOT NULL,
-            delta INTEGER NOT NULL,
-            detected_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS guild_config (
-            guild_id TEXT PRIMARY KEY,
-            channel_id TEXT NOT NULL,
-            faction TEXT NOT NULL,
-            alerts INTEGER NOT NULL DEFAULT 1
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS kv (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
+    c = sqlite3.connect(DB_FILE)
+    c.row_factory = sqlite3.Row
+    return c
 
 
-def iv(value):
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def fmt(value):
-    return f"{iv(value):,}"
-
-
-def pname(p):
-    return str(p.get("displayName") or p.get("username") or p.get("name") or p.get("uid") or "Unknown")
-
-
-def puid(p):
-    return str(p.get("uid") or p.get("id") or pname(p))
-
-
-def pfaction(p):
-    return str(p.get("factionName") or p.get("faction") or "Unknown")
-
-
-def pattacks(p):
-    return iv(p.get("attacks"))
-
-
-def ppoints(p):
-    return iv(p.get("factionPoints", p.get("points")))
-
-
-def pdamage(p):
-    return iv(p.get("totalDamage", p.get("damage")))
-
-
-async def fetch():
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://chronicles.wfitapp.xyz/",
-    }
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(API_URL, headers=headers) as response:
-            response.raise_for_status()
-            data = await response.json()
-            if not isinstance(data, dict):
-                raise ValueError("API returned an unexpected response.")
-            return data
-
-
-def factions(data):
-    return sorted(data.get("factions", []), key=lambda f: iv(f.get("rank")) or 999999)
-
-
-def get_faction(data, name):
-    q = str(name or "").strip().lower()
-    return next(
-        (f for f in data.get("factions", [])
-         if str(f.get("factionName", "")).strip().lower() == q),
-        None,
-    )
-
-
-def players(data, faction=None):
-    rows = list(data.get("entries", []))
-    if faction:
-        q = faction.strip().lower()
-        rows = [p for p in rows if pfaction(p).strip().lower() == q]
-    return sorted(rows, key=lambda p: (ppoints(p), pdamage(p), pattacks(p)), reverse=True)
+def init_db():
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS players_daily(
+            day TEXT NOT NULL, player_id TEXT NOT NULL, player_name TEXT NOT NULL,
+            faction TEXT NOT NULL, start_attacks INTEGER NOT NULL DEFAULT 0,
+            last_attacks INTEGER NOT NULL DEFAULT 0, attacks_today INTEGER NOT NULL DEFAULT 0,
+            first_seen TEXT, last_seen TEXT, PRIMARY KEY(day, player_id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS attack_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, detected_at TEXT NOT NULL,
+            player_id TEXT NOT NULL, player_name TEXT NOT NULL, faction TEXT NOT NULL,
+            delta INTEGER NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_meta(
+            day TEXT PRIMARY KEY, created_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tracker_config(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL, faction TEXT NOT NULL,
+            alerts INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(guild_id, faction))""")
+        # Migrate the old v1.x one-tracker-per-guild table.
+        old = c.execute("""SELECT 1 FROM sqlite_master
+                           WHERE type='table' AND name='guild_config'""").fetchone()
+        if old:
+            c.execute("""INSERT OR IGNORE INTO tracker_config
+                        (guild_id, channel_id, faction, alerts)
+                        SELECT guild_id, channel_id, faction, alerts FROM guild_config""")
+        c.commit()
 
 
 def load_configs():
     global configs
-    with db() as conn:
-        rows = conn.execute("SELECT * FROM guild_config").fetchall()
-    configs = {
-        row["guild_id"]: {
-            "channel_id": row["channel_id"],
-            "faction": row["faction"],
-            "alerts": bool(row["alerts"]),
+    configs = {}
+    with db() as c:
+        rows = c.execute("""SELECT guild_id, channel_id, faction, alerts
+                            FROM tracker_config ORDER BY guild_id, faction COLLATE NOCASE""").fetchall()
+    for r in rows:
+        gid = str(r["guild_id"])
+        key = r["faction"].strip().lower()
+        configs.setdefault(gid, {})[key] = {
+            "channel_id": str(r["channel_id"]),
+            "faction": r["faction"].strip(),
+            "alerts": bool(r["alerts"])
         }
-        for row in rows
-    }
 
 
-def save_config(guild_id, channel_id, faction):
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO guild_config(guild_id, channel_id, faction, alerts)
-            VALUES (?, ?, ?, 1)
-            ON CONFLICT(guild_id) DO UPDATE SET
-                channel_id=excluded.channel_id,
-                faction=excluded.faction
-        """, (str(guild_id), str(channel_id), faction))
-        conn.commit()
-    configs[str(guild_id)] = {"channel_id": str(channel_id), "faction": faction, "alerts": True}
+def trackers(guild_id):
+    return list(configs.get(str(guild_id), {}).values())
 
 
-def set_alerts(guild_id, enabled):
-    with db() as conn:
-        conn.execute("UPDATE guild_config SET alerts=? WHERE guild_id=?", (int(enabled), str(guild_id)))
-        conn.commit()
-    if str(guild_id) in configs:
-        configs[str(guild_id)]["alerts"] = enabled
+def save_tracker(guild_id, channel_id, faction):
+    faction = faction.strip()
+    if not faction:
+        raise ValueError("Faction cannot be empty")
+    with db() as c:
+        exists = c.execute("""SELECT 1 FROM tracker_config
+                              WHERE guild_id=? AND lower(faction)=lower(?)""",
+                           (str(guild_id), faction)).fetchone()
+        count = c.execute("""SELECT COUNT(*) FROM tracker_config WHERE guild_id=?""",
+                          (str(guild_id),)).fetchone()[0]
+        if not exists and count >= MAX_TRACKERS_PER_GUILD:
+            raise ValueError(f"Maximum {MAX_TRACKERS_PER_GUILD} trackers per server")
+        c.execute("""INSERT INTO tracker_config(guild_id, channel_id, faction, alerts)
+                     VALUES(?,?,?,1)
+                     ON CONFLICT(guild_id,faction) DO UPDATE SET
+                     channel_id=excluded.channel_id, faction=excluded.faction""",
+                  (str(guild_id), str(channel_id), faction))
+        c.commit()
+    load_configs()
 
 
-def configured_faction(guild_id, faction=None):
-    return faction or configs.get(str(guild_id), {}).get("faction")
+def remove_tracker(guild_id, faction):
+    with db() as c:
+        cur = c.execute("""DELETE FROM tracker_config
+                           WHERE guild_id=? AND lower(faction)=lower(?)""",
+                        (str(guild_id), faction.strip()))
+        c.commit()
+    load_configs()
+    return cur.rowcount
 
 
-def ensure_daily_meta(conn, day):
-    row = conn.execute("SELECT started_at FROM daily_meta WHERE day=?", (day,)).fetchone()
-    if row:
-        return row["started_at"]
-    stamp = iso_now()
-    conn.execute("INSERT INTO daily_meta(day, started_at) VALUES (?, ?)", (day, stamp))
-    return stamp
+def set_alerts(guild_id, enabled, faction=None):
+    with db() as c:
+        if faction:
+            cur = c.execute("""UPDATE tracker_config SET alerts=?
+                               WHERE guild_id=? AND lower(faction)=lower(?)""",
+                            (int(enabled), str(guild_id), faction.strip()))
+        else:
+            cur = c.execute("""UPDATE tracker_config SET alerts=? WHERE guild_id=?""",
+                            (int(enabled), str(guild_id)))
+        c.commit()
+    load_configs()
+    return cur.rowcount
 
 
-def record_daily(data):
-    today = day_key()
-    stamp = iso_now()
+def selected_faction(guild_id, faction=None):
+    ts = trackers(guild_id)
+    if faction:
+        for t in ts:
+            if t["faction"].lower() == faction.strip().lower():
+                return t["faction"]
+        return None
+    if len(ts) == 1:
+        return ts[0]["faction"]
+    return None
+
+
+async def fetch_api():
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": f"{BOT_NAME}/1.5.1"}) as s:
+        async with s.get(API_URL) as r:
+            r.raise_for_status()
+            return await r.json()
+
+
+def entries_from(data):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("entries", "players", "data", "leaderboard", "results"):
+            if isinstance(data.get(k), list):
+                return data[k]
+    return []
+
+
+def norm(x):
+    if not isinstance(x, dict):
+        return None
+    pid = x.get("id") or x.get("player_id") or x.get("uuid") or x.get("user_id")
+    name = x.get("name") or x.get("player_name") or x.get("username") or x.get("player")
+    faction = x.get("faction") or x.get("guild") or x.get("team")
+    attacks = x.get("attacks", x.get("attack_count", 0))
+    if pid is None or name is None or faction is None:
+        return None
+    try:
+        attacks = int(attacks or 0)
+    except (TypeError, ValueError):
+        attacks = 0
+    return {"id": str(pid), "name": str(name), "faction": str(faction), "attacks": attacks}
+
+
+def record(entries):
+    day = datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
+    seen = datetime.now(timezone.utc).isoformat()
     events = []
-
-    with db() as conn:
-        ensure_daily_meta(conn, today)
-
-        for p in data.get("entries", []):
-            uid, name, faction, current = puid(p), pname(p), pfaction(p), pattacks(p)
-            row = conn.execute(
-                "SELECT * FROM players_daily WHERE day=? AND uid=?",
-                (today, uid),
-            ).fetchone()
-
-            if row is None:
-                conn.execute("""
-                    INSERT INTO players_daily
-                    (day, uid, name, faction, start_attacks, last_attacks, attacks_today, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-                """, (today, uid, name, faction, current, current, stamp))
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO daily_meta(day,created_at) VALUES(?,?)", (day, seen))
+        for raw in entries:
+            e = norm(raw)
+            if not e:
                 continue
-
-            previous = iv(row["last_attacks"])
-            delta = max(0, current - previous)
-
+            row = c.execute("SELECT * FROM players_daily WHERE day=? AND player_id=?",
+                            (day, e["id"])).fetchone()
+            if row is None:
+                c.execute("""INSERT INTO players_daily
+                    (day,player_id,player_name,faction,start_attacks,last_attacks,
+                     attacks_today,first_seen,last_seen)
+                    VALUES(?,?,?,?,?,?,0,?,?)""",
+                    (day,e["id"],e["name"],e["faction"],e["attacks"],e["attacks"],seen,seen))
+                continue
+            delta = max(0, e["attacks"] - int(row["last_attacks"]))
+            c.execute("""UPDATE players_daily SET player_name=?,faction=?,last_attacks=?,
+                         attacks_today=attacks_today+?,last_seen=?
+                         WHERE day=? AND player_id=?""",
+                      (e["name"],e["faction"],e["attacks"],delta,seen,day,e["id"]))
             if delta:
-                event = {
-                    "uid": uid, "name": name, "faction": faction,
-                    "delta": delta, "detected_at": stamp,
-                }
-                events.append(event)
-                conn.execute("""
-                    INSERT INTO attack_events(day, uid, name, faction, delta, detected_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (today, uid, name, faction, delta, stamp))
-
-            conn.execute("""
-                UPDATE players_daily
-                SET name=?, faction=?, last_attacks=?, attacks_today=attacks_today+?, last_seen=?
-                WHERE day=? AND uid=?
-            """, (name, faction, current, delta, stamp, today, uid))
-
-        conn.commit()
-
+                c.execute("""INSERT INTO attack_events
+                    (day,detected_at,player_id,player_name,faction,delta)
+                    VALUES(?,?,?,?,?,?)""",
+                    (day,seen,e["id"],e["name"],e["faction"],delta))
+                events.append({**e,"delta":delta,"detected_at":seen})
+        c.commit()
     return events
 
 
-def parse_date(value):
-    if not value:
-        return day_key()
+def fmt_time(iso):
     try:
-        return datetime.strptime(value.strip(), "%Y-%m-%d").date().isoformat()
-    except ValueError as exc:
-        raise ValueError("Date must be YYYY-MM-DD.") from exc
-
-
-def time_only(value):
-    if not value:
+        return datetime.fromisoformat(iso.replace("Z","+00:00")).astimezone(LOCAL_TZ).strftime("%H:%M:%S")
+    except Exception:
         return "—"
+
+
+def embed_events(faction, events):
+    e = discord.Embed(title=f"⚔️ {faction} — Raid activity",
+                      description=f"{len(events)} new attack detection(s).",
+                      timestamp=datetime.now(timezone.utc))
+    for x in events[:20]:
+        e.add_field(name=x["name"],
+                    value=f"+{x['delta']} attack(s) • detected {fmt_time(x['detected_at'])} {TIMEZONE}",
+                    inline=False)
+    if len(events) > 20:
+        e.set_footer(text=f"+{len(events)-20} more")
+    return e
+
+
+@tree.command(name="setup", description="Set one faction to one Discord channel")
+@app_commands.describe(channel="Channel for this faction", faction="Faction name")
+async def setup(interaction: discord.Interaction, channel: discord.TextChannel, faction: str):
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%H:%M:%S")
-    except ValueError:
-        return value
+        existed = any(t["faction"].lower() == faction.strip().lower() for t in trackers(interaction.guild_id))
+        save_tracker(interaction.guild_id, channel.id, faction)
+        count = len(trackers(interaction.guild_id))
+        action = "updated" if existed else "added"
+        await interaction.response.send_message(
+            f"✅ **{faction.strip()}** {action} → {channel.mention}\n"
+            f"Active trackers: **{count}/{MAX_TRACKERS_PER_GUILD}**. Другите trackers не се пипат."
+        )
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
 
 
-def daily_rows(faction, target_day):
-    with db() as conn:
-        meta = conn.execute(
-            "SELECT started_at FROM daily_meta WHERE day=?", (target_day,)
-        ).fetchone()
-        rows = conn.execute("""
-            SELECT p.*,
-                   (SELECT MAX(e.detected_at)
-                    FROM attack_events e
-                    WHERE e.day=p.day AND e.uid=p.uid) AS last_attack_at
-            FROM players_daily p
-            WHERE p.day=? AND lower(p.faction)=lower(?)
-            ORDER BY attacks_today DESC, name COLLATE NOCASE
-        """, (target_day, faction)).fetchall()
-    return (meta["started_at"] if meta else None), rows
-
-
-def daily_embed(faction, view="all", target_day=None):
-    target_day = target_day or day_key()
-    started, rows = daily_rows(faction, target_day)
-    attacked = [r for r in rows if iv(r["attacks_today"]) > 0]
-    missing = [r for r in rows if iv(r["attacks_today"]) == 0]
-
-    shown = rows if view == "all" else attacked if view == "attacked" else missing
-    title = {
-        "all": "DAILY ATTACK CHECK",
-        "attacked": "ATTACKED",
-        "missing": "NOT ATTACKED",
-    }.get(view, "DAILY ATTACK CHECK")
-
-    e = discord.Embed(title=f"⚡ {faction.upper()} — {title}", color=0x42F5C5)
-    if not rows:
-        e.description = f"No roster captured for **{target_day}**."
-        e.set_footer(text=f"{BOT_NAME} v{VERSION} • UTC")
-        return e
-
-    e.description = (
-        f"Day: **{target_day}** • Roster: **{len(rows)}** • "
-        f"Attacked: **{len(attacked)}** • Missing: **{len(missing)}**"
-    )
-
+@tree.command(name="status", description="List all faction/channel trackers")
+async def status(interaction: discord.Interaction):
+    ts = trackers(interaction.guild_id)
+    if not ts:
+        await interaction.response.send_message("Няма trackers. Започни с `/setup`.")
+        return
     lines = []
-    for i, row in enumerate(shown, 1):
-        attacks = iv(row["attacks_today"])
-        if attacks:
-            lines.append(
-                f"{i}. **{row['name']}** — **{attacks}** attack(s) • 🕒 **{time_only(row['last_attack_at'])} UTC**"
-            )
-        else:
-            lines.append(f"{i}. **{row['name']}** — **0** attacks")
-
-    chunks, current = [], ""
-    for line in lines:
-        if len(current) + len(line) + 1 > 1000:
-            chunks.append(current)
-            current = ""
-        current += ("\n" if current else "") + line
-    if current:
-        chunks.append(current)
-
-    for i, chunk in enumerate(chunks):
-        e.add_field(name="PLAYERS" if i == 0 else "CONTINUED", value=chunk, inline=False)
-
-    coverage = f"Tracker started {time_only(started)} UTC." if started else "Tracker start time unavailable."
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • {coverage} • attack times = detection times")
-    return e
-
-
-def activity_embed(faction, events):
-    lines = [
-        f"• **{x['name']}** +{x['delta']} attack(s) • 🕒 **{time_only(x['detected_at'])} UTC**"
-        for x in events
-    ]
-    e = discord.Embed(title="⚡ RAID ACTIVITY", description="\n".join(lines), color=0x42F5C5)
-    e.add_field(name="TRACKED FACTION", value=f"**{faction}**", inline=False)
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • UTC • detection timestamp")
-    return e
-
-
-def factions_embed(data):
-    e = discord.Embed(title="⚡ FACTION LEADERBOARD", color=0x42F5C5)
-    for i, f in enumerate(factions(data), 1):
-        rank = iv(f.get("rank")) or i
-        medal = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"#{rank}"
-        e.add_field(
-            name=f"{medal} {f.get('factionName', 'Unknown')}",
-            value=(
-                f"Points: **{fmt(f.get('points'))}** • Damage: **{fmt(f.get('damage'))}**\n"
-                f"Attacks: **{fmt(f.get('attacks'))}** • Players: **{fmt(f.get('players'))}** • Wins: **{fmt(f.get('wins'))}**"
-            ),
-            inline=False,
-        )
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • LIVE DATA")
-    return e
-
-
-def top_embed(data, count=5, faction=None):
-    rows = players(data, faction)[:count]
-    title = f"⚡ TOP {count} PLAYERS" + (f" — {faction.upper()}" if faction else "")
-    e = discord.Embed(title=title, color=0x42F5C5)
-    for i, p in enumerate(rows, 1):
-        e.add_field(
-            name=f"{i}. {pname(p)}",
-            value=f"Points: **{fmt(ppoints(p))}** • Damage: **{fmt(pdamage(p))}** • Attacks: **{fmt(pattacks(p))}**",
-            inline=False,
-        )
-    if not rows:
-        e.description = "No players found."
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • LIVE DATA")
-    return e
-
-
-def raid_embed(data):
-    fs = data.get("factions", [])
-    e = discord.Embed(
-        title=f"⚡ {str(data.get('name') or 'RAID').upper()}",
-        description=f"Status: **{data.get('status', 'Unknown')}**",
-        color=0x42F5C5,
+    for i, t in enumerate(ts, 1):
+        ch = interaction.guild.get_channel(int(t["channel_id"]))
+        mention = ch.mention if ch else f"<#{t['channel_id']}>"
+        lines.append(f"`{i}` **{t['faction']}** → {mention} • alerts `{'ON' if t['alerts'] else 'OFF'}`")
+    await interaction.response.send_message(
+        f"📡 **RaidOps — {len(ts)}/{MAX_TRACKERS_PER_GUILD} trackers**\n" + "\n".join(lines)
     )
-    for label, value in [
-        ("FACTIONS", len(fs)),
-        ("TOTAL POINTS", sum(iv(f.get("points")) for f in fs)),
-        ("TOTAL DAMAGE", sum(iv(f.get("damage")) for f in fs)),
-        ("TOTAL ATTACKS", sum(iv(f.get("attacks")) for f in fs)),
-    ]:
-        e.add_field(name=label, value=fmt(value), inline=True)
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • LIVE DATA")
-    return e
 
 
-def stats_embed(data, faction):
-    f = get_faction(data, faction)
-    e = discord.Embed(title=f"⚡ {faction.upper()} — STATS", color=0x42F5C5)
-    if not f:
-        e.description = "Faction not found."
-        return e
-    e.description = f"Rank **#{iv(f.get('rank'))}**"
-    for label, key in [
-        ("POINTS", "points"), ("DAMAGE", "damage"),
-        ("ATTACKS", "attacks"), ("PLAYERS", "players"), ("WINS", "wins"),
-    ]:
-        e.add_field(name=label, value=fmt(f.get(key)), inline=True)
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • LIVE DATA")
-    return e
-
-
-def gap_embed(data, faction):
-    fs = factions(data)
-    f = get_faction(data, faction)
-    e = discord.Embed(title=f"⚡ {faction.upper()} — GAP", color=0x42F5C5)
-    if not f:
-        e.description = "Faction not found."
-        return e
-    idx = next(
-        (i for i, x in enumerate(fs)
-         if str(x.get("factionName", "")).lower() == str(f.get("factionName", "")).lower()),
-        None,
-    )
-    if idx == 0:
-        e.description = "Rank **#1** — no faction above."
-    elif idx is not None:
-        above = fs[idx - 1]
-        gap = max(0, iv(above.get("points")) - iv(f.get("points")))
-        e.description = (
-            f"Current: **#{iv(f.get('rank'))} {f.get('factionName')}**\n"
-            f"Above: **{above.get('factionName')}**\n"
-            f"Points gap: **{fmt(gap)}**"
-        )
+@tree.command(name="remove_tracker", description="Remove a faction tracker")
+@app_commands.describe(faction="Faction to remove")
+async def remove(interaction: discord.Interaction, faction: str):
+    if remove_tracker(interaction.guild_id, faction):
+        await interaction.response.send_message(f"🗑️ Removed **{faction.strip()}** tracker.")
     else:
-        e.description = "Rank data unavailable."
-    return e
+        await interaction.response.send_message(f"Няма tracker за **{faction.strip()}**.", ephemeral=True)
 
 
-def intel_embed(data, faction):
-    f = get_faction(data, faction)
-    e = discord.Embed(title=f"⚡ {faction.upper()} — INTEL", color=0x42F5C5)
-    if not f:
-        e.description = "Faction not found."
-        return e
-    e.description = f"Rank **#{iv(f.get('rank'))}**"
-    fs = factions(data)
-    idx = next(
-        (i for i, x in enumerate(fs)
-         if str(x.get("factionName", "")).lower() == str(f.get("factionName", "")).lower()),
-        None,
-    )
-    if idx is not None and idx > 0:
-        above = fs[idx - 1]
-        e.add_field(
-            name="NEXT TARGET",
-            value=f"**{above.get('factionName')}**\nPoints gap: **{fmt(max(0, iv(above.get('points')) - iv(f.get('points'))))}**",
-            inline=False,
-        )
-    rows = players(data, faction)[:3]
-    e.add_field(
-        name="TOP 3",
-        value="\n".join(
-            f"{i}. **{pname(p)}** — {fmt(ppoints(p))} points"
-            for i, p in enumerate(rows, 1)
-        ) or "No player data.",
-        inline=False,
-    )
-    return e
-
-
-async def faction_autocomplete(interaction, current):
-    try:
-        names = [str(f.get("factionName", "")).strip() for f in (await fetch()).get("factions", [])]
-    except Exception:
-        names = []
-    q = current.lower().strip()
-    return [
-        app_commands.Choice(name=n, value=n)
-        for n in names if n and (not q or q in n.lower())
-    ][:25]
-
-
-@tree.command(name="setup", description="Configure the automatic channel and faction.")
-@app_commands.describe(channel="Channel for automatic raid alerts.", faction="Faction to track.")
-@app_commands.autocomplete(faction=faction_autocomplete)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def setup(interaction, channel: discord.TextChannel, faction: str):
-    data = await fetch()
-    f = get_faction(data, faction)
-    if not f:
-        await interaction.response.send_message("Faction not found. Choose from autocomplete.", ephemeral=True)
-        return
-    name = str(f.get("factionName"))
-    save_config(interaction.guild_id, channel.id, name)
+@tree.command(name="enable", description="Enable alerts for one faction or all")
+@app_commands.describe(faction="Optional faction")
+async def enable(interaction: discord.Interaction, faction: str | None = None):
+    n = set_alerts(interaction.guild_id, True, faction)
     await interaction.response.send_message(
-        f"⚡ **{BOT_NAME} v{VERSION} configured**\n"
-        f"Channel: {channel.mention}\nFaction: **{name}**\n"
-        f"Automatic alerts: **ON**\nDaily tracking: **ON**\nTimezone: **UTC**\nAPI limit: **60**",
-        ephemeral=True,
+        f"🔔 Alerts ON: **{faction.strip()}**." if faction else f"🔔 Alerts ON for **{n}** tracker(s)."
     )
 
 
-@tree.command(name="status", description="Show bot configuration and storage status.")
-async def status(interaction):
-    c = configs.get(str(interaction.guild_id))
-    if not c:
-        await interaction.response.send_message("Not configured. Use `/setup`.", ephemeral=True)
-        return
-    ch = interaction.guild.get_channel(iv(c["channel_id"]))
-    try:
-        with db() as conn:
-            db_ok = conn.execute("SELECT 1").fetchone() is not None
-    except Exception:
-        db_ok = False
+@tree.command(name="disable", description="Disable alerts for one faction or all")
+@app_commands.describe(faction="Optional faction")
+async def disable(interaction: discord.Interaction, faction: str | None = None):
+    n = set_alerts(interaction.guild_id, False, faction)
     await interaction.response.send_message(
-        f"**{BOT_NAME} v{VERSION}**\n"
-        f"Channel: {ch.mention if ch else 'not found'}\n"
-        f"Faction: **{c['faction']}**\n"
-        f"Alerts: **{'ON' if c['alerts'] else 'OFF'}**\n"
-        f"Timezone: **UTC**\nAPI limit: **60**\n"
-        f"Database: **{'OK' if db_ok else 'ERROR'}**\n"
-        f"DB path: `{DB_FILE}`",
-        ephemeral=True,
+        f"🔕 Alerts OFF: **{faction.strip()}**." if faction else f"🔕 Alerts OFF for **{n}** tracker(s)."
     )
 
 
-@tree.command(name="daily", description="Show daily attacks: all, attacked, or missing.")
-@app_commands.describe(
-    faction="Optional; defaults to the server faction.",
-    view="Choose all, attacked, or missing.",
-    date="Optional UTC date in YYYY-MM-DD.",
-)
-@app_commands.autocomplete(faction=faction_autocomplete)
-@app_commands.choices(view=[
-    app_commands.Choice(name="all", value="all"),
-    app_commands.Choice(name="attacked", value="attacked"),
-    app_commands.Choice(name="missing", value="missing"),
-])
-async def daily(interaction, faction: Optional[str] = None, view: str = "all", date: Optional[str] = None):
-    faction = configured_faction(interaction.guild_id, faction)
-    if not faction:
-        await interaction.response.send_message("Choose a faction or use `/setup`.", ephemeral=True)
+@tree.command(name="daily", description="Show today's or a selected day's attacks")
+@app_commands.describe(faction="Faction", day="YYYY-MM-DD")
+async def daily(interaction: discord.Interaction, faction: str | None = None, day: str | None = None):
+    fac = selected_faction(interaction.guild_id, faction)
+    if faction and not fac:
+        await interaction.response.send_message(f"Няма tracker за **{faction}**.", ephemeral=True)
         return
-    try:
-        target = parse_date(date)
-    except ValueError as ex:
-        await interaction.response.send_message(str(ex), ephemeral=True)
+    if not fac:
+        ts = trackers(interaction.guild_id)
+        if len(ts) > 1:
+            await interaction.response.send_message(
+                "Има 2+ trackers. Посочи faction в `/daily`.", ephemeral=True)
+            return
+        if not ts:
+            await interaction.response.send_message("Няма настроен tracker.", ephemeral=True)
+            return
+    day = day or datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
+    with db() as c:
+        rows = c.execute("""SELECT player_name,attacks_today FROM players_daily
+                           WHERE day=? AND lower(faction)=lower(?)
+                           ORDER BY attacks_today DESC, player_name COLLATE NOCASE""",
+                        (day,fac)).fetchall()
+    if not rows:
+        await interaction.response.send_message(f"Няма записи за **{fac}** на {day}.")
         return
-    await interaction.response.defer()
+    text = "\n".join(f"`{i:02}` **{r['player_name']}** — `{r['attacks_today']}` attack(s)"
+                     for i,r in enumerate(rows[:50],1))
+    e = discord.Embed(title=f"📅 Daily — {fac}", description=text)
+    e.set_footer(text=f"{day} • {TIMEZONE}")
+    await interaction.response.send_message(embed=e)
+
+
+@tree.command(name="dailyhistory", description="Show daily history for YYYY-MM-DD")
+async def dailyhistory(interaction: discord.Interaction, day: str):
     try:
-        if target == day_key():
-            record_daily(await fetch())
-        await interaction.followup.send(embed=daily_embed(faction, view, target))
-    except Exception as ex:
-        await interaction.followup.send(f"⚠️ Daily tracker error: `{type(ex).__name__}`")
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        await interaction.response.send_message("Използвай YYYY-MM-DD.", ephemeral=True)
+        return
+    with db() as c:
+        rows = c.execute("""SELECT faction,player_name,attacks_today FROM players_daily
+                            WHERE day=? ORDER BY faction,attacks_today DESC,player_name""",
+                         (day,)).fetchall()
+    if not rows:
+        await interaction.response.send_message(f"Няма история за {day}.")
+        return
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["faction"], []).append(r)
+    out=[]
+    for fac, items in grouped.items():
+        out.append(f"**{fac}**")
+        out.extend(f"• {x['player_name']}: {x['attacks_today']}" for x in items[:15])
+    await interaction.response.send_message(f"📚 **History {day}**\n" + "\n".join(out)[:3900])
 
 
-@tree.command(name="dailyhistory", description="Show recently recorded daily history.")
-@app_commands.describe(days="Number of days to show, 1-30.")
-async def dailyhistory(interaction, days: Optional[int] = 7):
-    days = max(1, min(days or 7, 30))
-    await interaction.response.defer()
-    with db() as conn:
-        rows = conn.execute("""
-            SELECT d.day, d.started_at,
-                   COUNT(p.uid) roster,
-                   COALESCE(SUM(CASE WHEN p.attacks_today > 0 THEN 1 ELSE 0 END), 0) attacked
-            FROM daily_meta d
-            LEFT JOIN players_daily p ON p.day=d.day
-            GROUP BY d.day, d.started_at
-            ORDER BY d.day DESC
-            LIMIT ?
-        """, (days,)).fetchall()
-
-    e = discord.Embed(title="⚡ DAILY HISTORY", color=0x42F5C5)
-    e.description = "\n".join(
-        f"**{r['day']}** — {iv(r['attacked'])}/{iv(r['roster'])} attacked • started {time_only(r['started_at'])} UTC"
+@tree.command(name="activity", description="Show latest detected attacks")
+async def activity(interaction: discord.Interaction, faction: str | None = None):
+    with db() as c:
+        if faction:
+            rows=c.execute("""SELECT * FROM attack_events WHERE day=? AND lower(faction)=lower(?)
+                             ORDER BY id DESC LIMIT 20""",
+                           (datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime("%Y-%m-%d"),faction)).fetchall()
+        else:
+            rows=c.execute("""SELECT * FROM attack_events WHERE day=? ORDER BY id DESC LIMIT 20""",
+                           (datetime.now(timezone.utc).astimezone(LOCAL_TZ).strftime("%Y-%m-%d"),)).fetchall()
+    if not rows:
+        await interaction.response.send_message("Няма засечена activity днес.")
+        return
+    await interaction.response.send_message("\n".join(
+        f"• **{r['player_name']}** ({r['faction']}) +{r['delta']} at {fmt_time(r['detected_at'])}"
         for r in rows
-    ) if rows else "No history recorded yet."
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • persistent SQLite history")
-    await interaction.followup.send(embed=e)
+    ))
 
 
-@tree.command(name="activity", description="Show today's recorded attack events.")
-@app_commands.describe(faction="Optional; defaults to server faction.", limit="Number of events, 1-20.")
-@app_commands.autocomplete(faction=faction_autocomplete)
-async def activity(interaction, faction: Optional[str] = None, limit: Optional[int] = 10):
-    faction = configured_faction(interaction.guild_id, faction)
-    if not faction:
-        await interaction.response.send_message("Choose a faction or use `/setup`.", ephemeral=True)
-        return
-    limit = max(1, min(limit or 10, 20))
+@tree.command(name="update", description="Force an API update now")
+async def update(interaction: discord.Interaction):
     await interaction.response.defer()
-    with db() as conn:
-        rows = conn.execute("""
-            SELECT name, delta, detected_at
-            FROM attack_events
-            WHERE day=? AND lower(faction)=lower(?)
-            ORDER BY id DESC
-            LIMIT ?
-        """, (day_key(), faction, limit)).fetchall()
-    e = discord.Embed(title=f"⚡ {faction.upper()} — RECENT ACTIVITY", color=0x42F5C5)
-    e.description = "\n".join(
-        f"**{r['name']}** +{iv(r['delta'])} attack(s) • 🕒 {time_only(r['detected_at'])} UTC"
-        for r in rows
-    ) if rows else "No attacks recorded today."
-    e.set_footer(text=f"{BOT_NAME} v{VERSION} • detection timestamps")
-    await interaction.followup.send(embed=e)
+    try:
+        events=record(entries_from(await fetch_api()))
+        await interaction.followup.send(f"✅ Updated. New attack events: **{len(events)}**.")
+    except Exception as exc:
+        await interaction.followup.send(f"❌ API error: `{type(exc).__name__}: {exc}`")
 
 
-@tree.command(name="update", description="Post the live faction leaderboard to the configured channel.")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def update_cmd(interaction):
-    c = configs.get(str(interaction.guild_id))
-    if not c:
-        await interaction.response.send_message("Use `/setup` first.", ephemeral=True)
-        return
-    ch = interaction.guild.get_channel(iv(c["channel_id"]))
-    if not ch:
-        await interaction.response.send_message("Configured channel not found.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    await ch.send(embed=factions_embed(await fetch()))
-    await interaction.followup.send("⚡ Live leaderboard posted.", ephemeral=True)
+@tree.command(name="top5", description="Current top 5")
+async def top5(interaction: discord.Interaction, faction: str | None = None):
+    await current_top(interaction, 5, faction)
 
 
-@tree.command(name="top5", description="Show top 5 players.")
-@app_commands.describe(faction="Optional faction filter.")
-@app_commands.autocomplete(faction=faction_autocomplete)
-async def top5(interaction, faction: Optional[str] = None):
-    await interaction.response.defer()
-    await interaction.followup.send(embed=top_embed(await fetch(), 5, faction))
+@tree.command(name="top10", description="Current top 10")
+async def top10(interaction: discord.Interaction, faction: str | None = None):
+    await current_top(interaction, 10, faction)
 
 
-@tree.command(name="top10", description="Show top 10 players.")
-@app_commands.describe(faction="Optional faction filter.")
-@app_commands.autocomplete(faction=faction_autocomplete)
-async def top10(interaction, faction: Optional[str] = None):
-    await interaction.response.defer()
-    await interaction.followup.send(embed=top_embed(await fetch(), 10, faction))
+async def current_top(interaction, n, faction):
+    try:
+        xs=[norm(x) for x in entries_from(await fetch_api())]
+        xs=[x for x in xs if x and (not faction or x["faction"].lower()==faction.lower())]
+        xs.sort(key=lambda x:x["attacks"], reverse=True)
+        lines=[f"`{i:02}` **{x['name']}** — {x['attacks']} ({x['faction']})"
+                for i,x in enumerate(xs[:n],1)]
+        await interaction.response.send_message(f"🏆 **Top {n}**\n" + ("\n".join(lines) or "No data."))
+    except Exception as exc:
+        await interaction.response.send_message(f"❌ API error: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
-@tree.command(name="topfactions", description="Show all factions ranked.")
-async def topfactions(interaction):
-    await interaction.response.defer()
-    await interaction.followup.send(embed=factions_embed(await fetch()))
+@tree.command(name="topfactions", description="Current faction totals")
+async def topfactions(interaction: discord.Interaction):
+    try:
+        totals={}
+        for x in (norm(v) for v in entries_from(await fetch_api())):
+            if x: totals[x["faction"]]=totals.get(x["faction"],0)+x["attacks"]
+        lines=[f"`{i}` **{k}** — {v}" for i,(k,v) in enumerate(sorted(totals.items(),key=lambda z:z[1],reverse=True)[:10],1)]
+        await interaction.response.send_message("🏰 **Top factions**\n"+("\n".join(lines) or "No data."))
+    except Exception as exc:
+        await interaction.response.send_message(f"❌ API error: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
-@tree.command(name="raid", description="Show overall raid status.")
-async def raid(interaction):
-    await interaction.response.defer()
-    await interaction.followup.send(embed=raid_embed(await fetch()))
+@tree.command(name="stats", description="Stats for a faction")
+async def stats(interaction: discord.Interaction, faction: str):
+    try:
+        xs=[norm(v) for v in entries_from(await fetch_api())]
+        xs=[x for x in xs if x and x["faction"].lower()==faction.lower()]
+        if not xs:
+            await interaction.response.send_message(f"No data for **{faction}**.")
+            return
+        total=sum(x["attacks"] for x in xs)
+        await interaction.response.send_message(f"📊 **{faction}** — {len(xs)} players • {total} attacks • avg `{total/len(xs):.1f}`")
+    except Exception as exc:
+        await interaction.response.send_message(f"❌ API error: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
-@tree.command(name="stats", description="Show stats for a faction.")
-@app_commands.describe(faction="Faction to inspect.")
-@app_commands.autocomplete(faction=faction_autocomplete)
-async def stats(interaction, faction: str):
-    await interaction.response.defer()
-    await interaction.followup.send(embed=stats_embed(await fetch(), faction))
+@tree.command(name="gap", description="Attack gap inside a faction")
+async def gap(interaction: discord.Interaction, faction: str):
+    try:
+        xs=[norm(v) for v in entries_from(await fetch_api())]
+        xs=[x for x in xs if x and x["faction"].lower()==faction.lower()]
+        if not xs:
+            await interaction.response.send_message(f"No data for **{faction}**.")
+            return
+        xs.sort(key=lambda x:x["attacks"],reverse=True)
+        await interaction.response.send_message(
+            f"📐 **{faction}** gap: `{xs[0]['attacks']-xs[-1]['attacks']}` "
+            f"({xs[0]['name']} {xs[0]['attacks']} → {xs[-1]['name']} {xs[-1]['attacks']})")
+    except Exception as exc:
+        await interaction.response.send_message(f"❌ API error: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
-@tree.command(name="gap", description="Show the points gap to the faction above.")
-@app_commands.describe(faction="Optional; defaults to server faction.")
-@app_commands.autocomplete(faction=faction_autocomplete)
-async def gap(interaction, faction: Optional[str] = None):
-    faction = configured_faction(interaction.guild_id, faction)
-    if not faction:
-        await interaction.response.send_message("Choose a faction or use `/setup`.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    await interaction.followup.send(embed=gap_embed(await fetch(), faction))
-
-
-@tree.command(name="intel", description="Show tactical faction intel.")
-@app_commands.describe(faction="Optional; defaults to server faction.")
-@app_commands.autocomplete(faction=faction_autocomplete)
-async def intel(interaction, faction: Optional[str] = None):
-    faction = configured_faction(interaction.guild_id, faction)
-    if not faction:
-        await interaction.response.send_message("Choose a faction or use `/setup`.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    await interaction.followup.send(embed=intel_embed(await fetch(), faction))
-
-
-@tree.command(name="disable", description="Disable automatic attack alerts.")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def disable(interaction):
-    set_alerts(interaction.guild_id, False)
+@tree.command(name="intel", description="Bot configuration")
+async def intel(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "⚡ Automatic attack alerts disabled. Daily tracking stays ON.",
-        ephemeral=True,
-    )
-
-
-@tree.command(name="enable", description="Enable automatic attack alerts.")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def enable(interaction):
-    if str(interaction.guild_id) not in configs:
-        await interaction.response.send_message("Use `/setup` first.", ephemeral=True)
-        return
-    set_alerts(interaction.guild_id, True)
-    await interaction.response.send_message("⚡ Automatic attack alerts enabled.", ephemeral=True)
+        f"🤖 **{BOT_NAME} v1.5.1**\nAPI limit `60` • Poll `{POLL_SECONDS}s` • Timezone `{TIMEZONE}`\n"
+        f"Trackers `{len(trackers(interaction.guild_id))}/{MAX_TRACKERS_PER_GUILD}` • DB `{DB_FILE}`")
 
 
 @tasks.loop(seconds=POLL_SECONDS)
 async def monitor():
     try:
-        data = await fetch()
-        events = record_daily(data)
+        events=record(entries_from(await fetch_api()))
         if not events:
             return
-
-        for gid, c in list(configs.items()):
-            if not c.get("alerts", True):
-                continue
-            wanted = c["faction"].strip().lower()
-            relevant = [e for e in events if e["faction"].strip().lower() == wanted]
-            if not relevant:
-                continue
-            guild = client.get_guild(iv(gid))
+        # Crucial: every configured faction gets its own independent channel.
+        for gid, faction_map in list(configs.items()):
+            guild=client.get_guild(int(gid))
             if not guild:
                 continue
-            channel = guild.get_channel(iv(c["channel_id"]))
-            if not channel:
-                continue
-            try:
-                await channel.send(embed=activity_embed(c["faction"], relevant))
-            except Exception as ex:
-                print("Activity post error:", gid, type(ex).__name__, ex)
-    except Exception as ex:
-        print("Monitor error:", type(ex).__name__, ex)
+            for t in faction_map.values():
+                if not t["alerts"]:
+                    continue
+                relevant=[e for e in events if e["faction"].strip().lower()==t["faction"].strip().lower()]
+                if not relevant:
+                    continue
+                channel=guild.get_channel(int(t["channel_id"]))
+                if channel:
+                    try:
+                        await channel.send(embed=embed_events(t["faction"], relevant))
+                    except Exception as exc:
+                        print(f"[monitor] send failed {guild.id}/{t['faction']}: {exc}")
+    except Exception as exc:
+        print(f"[monitor] {type(exc).__name__}: {exc}")
 
 
 @monitor.before_loop
@@ -757,32 +485,29 @@ async def before_monitor():
 async def sync_commands():
     for guild in client.guilds:
         try:
-            tree.clear_commands(guild=guild)
             tree.copy_global_to(guild=guild)
-            synced = await tree.sync(guild=guild)
-            print(f"Guild sync: {guild.name} -> {len(synced)} commands")
-        except Exception as ex:
-            print("Guild sync error:", guild.id, type(ex).__name__, ex)
+            synced=await tree.sync(guild=guild)
+            print(f"[sync] {guild.name}: {len(synced)} commands")
+        except Exception as exc:
+            print(f"[sync] guild {guild.id}: {exc}")
     try:
-        tree.clear_commands(guild=None)
         await tree.sync()
-        print("Legacy global commands cleared.")
-    except Exception as ex:
-        print("Global cleanup error:", type(ex).__name__, ex)
+        print("[sync] global commands synced")
+    except Exception as exc:
+        print(f"[sync] global: {exc}")
 
 
 @client.event
 async def on_ready():
+    global monitor_started
+    init_db()
     load_configs()
-    print(f"{BOT_NAME} v{VERSION} | Logged in as {client.user} | Servers: {len(client.guilds)}")
-    print(f"API: {API_URL}")
-    print(f"Timezone: UTC | DB: {DB_FILE} | Poll: {POLL_SECONDS}s")
-    await sync_commands()
-    if not monitor.is_running():
+    print(f"[ready] {BOT_NAME} as {client.user}")
+    print(f"[ready] DB={DB_FILE} TZ={TIMEZONE} poll={POLL_SECONDS}s trackers={sum(len(v) for v in configs.values())}")
+    if not monitor_started:
+        await sync_commands()
         monitor.start()
+        monitor_started=True
 
-
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing.")
 
 client.run(TOKEN)
