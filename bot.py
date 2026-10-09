@@ -73,18 +73,19 @@ class RaidBot(commands.Bot):
 
     async def on_ready(self):
         log.info('RaidOps v2 ready; servers=%d', len(self.guilds))
-        # Replace v1's guild-local commands, which otherwise shadow v2 globals.
+        # Keep one global command set; remove legacy per-guild copies.
         for guild in self.guilds:
             if guild.id not in self.synced_guilds:
                 await self.sync_guild(guild)
 
     async def sync_guild(self, guild):
         try:
-            self.tree.copy_global_to(guild=guild)
+            self.tree.clear_commands(guild=guild)
             await self.tree.sync(guild=guild)
             self.synced_guilds.add(guild.id)
+            log.info('Command cleanup complete for server %s; global commands retained', guild.id)
         except discord.HTTPException:
-            log.warning('Guild command sync failed for %s; will retry on next ready', guild.id)
+            log.warning('Guild command cleanup failed for %s; will retry on next ready', guild.id)
 
     async def on_guild_join(self, guild):
         await self.sync_guild(guild)
