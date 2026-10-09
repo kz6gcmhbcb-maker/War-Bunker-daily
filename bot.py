@@ -115,7 +115,28 @@ class RaidBot(commands.Bot):
                     if not isinstance(channel, discord.TextChannel) or channel.guild.id != int(item['guild_id']):
                         raise ValueError('Invalid delivery channel')
                     event = sanitized(item)
-                    await channel.send(embed=views.activity_embed(safe(item['faction']), [event]))
+                 subscribers = await asyncio.to_thread(
+                        self.store.subscribers, item['guild_id'])
+                    batches = [
+                        subscribers[i:i+70]
+                        for i in range(0, len(subscribers), 70)
+                    ] or [[]]
+                    for i, batch in enumerate(batches):
+                        content = ' '.join(f'<@{uid}>' for uid in batch) or None
+                        if i:
+                            content += '\nAttack notification — see the report above.'
+                        await channel.send(
+                            content=content,
+                            embed=views.activity_embed(
+                                safe(item['faction']), [event]
+                            ) if i == 0 else None,
+                            allowed_mentions=discord.AllowedMentions(
+                                everyone=False,
+                                roles=False,
+                                users=[discord.Object(id=uid) for uid in batch],
+                                replied_user=False,
+                            ),
+                        )
                     await asyncio.to_thread(self.store.delivered, item['id'])
                 except Exception as exc:
                     log.warning('Delivery %s failed (%s)', item['id'], type(exc).__name__)
@@ -216,7 +237,26 @@ class RaidBot(commands.Bot):
                 await interaction.followup.send(message, ephemeral=True)
             else:
                 await interaction.response.send_message(message, ephemeral=True)
-
+@tree.command(name='silent', description='Control your personal attack pings.')
+        @app_commands.guild_only()
+        @app_commands.choices(mode=[
+            app_commands.Choice(name='on — stop my pings', value='on'),
+            app_commands.Choice(name='off — notify me', value='off'),
+        ])
+        async def silent(interaction: discord.Interaction, mode: str):
+            await interaction.response.defer(ephemeral=True)
+            await asyncio.to_thread(
+                self.store.set_silent,
+                interaction.guild_id,
+                interaction.user.id,
+                mode == 'on',
+            )
+            text = '🔕 Personal pings OFF.' if mode == 'on' else '🔔 Personal pings ON.'
+            await interaction.followup.send(
+                text + '\nSet raid channels to Only @mentions. '
+                'Tracking and public reports continue.',
+                ephemeral=True,
+            )
         @tree.command(name='setup', description='Configure one of six faction trackers.')
         @app_commands.guild_only()
         @app_commands.default_permissions(manage_guild=True)
