@@ -115,7 +115,7 @@ class RaidBot(commands.Bot):
                     if not isinstance(channel, discord.TextChannel) or channel.guild.id != int(item['guild_id']):
                         raise ValueError('Invalid delivery channel')
                     event = sanitized(item)
-                 subscribers = await asyncio.to_thread(
+                    subscribers = await asyncio.to_thread(
                         self.store.subscribers, item['guild_id'])
                     batches = [
                         subscribers[i:i+70]
@@ -237,7 +237,7 @@ class RaidBot(commands.Bot):
                 await interaction.followup.send(message, ephemeral=True)
             else:
                 await interaction.response.send_message(message, ephemeral=True)
-@tree.command(name='silent', description='Control your personal attack pings.')
+        @tree.command(name='silent', description='Control your personal attack pings.')
         @app_commands.guild_only()
         @app_commands.choices(mode=[
             app_commands.Choice(name='on — stop my pings', value='on'),
