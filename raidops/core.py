@@ -89,6 +89,8 @@ class Store:
               attempts INTEGER NOT NULL DEFAULT 0, next_try REAL NOT NULL DEFAULT 0,
               UNIQUE(event_id,guild_id,faction));
             CREATE TABLE IF NOT EXISTS meta_v2 (key TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE IF NOT EXISTS notification_v2 (
+              guild_id TEXT, user_id TEXT, PRIMARY KEY(guild_id,user_id));
             ''')
             if not c.execute("SELECT 1 FROM meta_v2 WHERE key='migration'").fetchone():
                 exists = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='guild_config'").fetchone()
@@ -132,6 +134,17 @@ class Store:
                 c.execute('UPDATE tracker_v2 SET alerts=? WHERE ' + where, (int(enabled), *args))
             if not enabled:
                 c.execute('DELETE FROM delivery_v2 WHERE ' + where, args)
+
+    def set_silent(self, guild_id, user_id, enabled):
+        with self.connection() as c:
+            if enabled:
+                c.execute('DELETE FROM notification_v2 WHERE guild_id=? AND user_id=?', (str(guild_id),str(user_id)))
+            else:
+                c.execute('INSERT OR IGNORE INTO notification_v2 VALUES(?,?)', (str(guild_id),str(user_id)))
+
+    def subscribers(self, guild_id):
+        with self.connection() as c:
+            return [int(r['user_id']) for r in c.execute('SELECT user_id FROM notification_v2 WHERE guild_id=? ORDER BY user_id', (str(guild_id),))]
 
     def ingest(self, data, moment=None):
         validate(data)
